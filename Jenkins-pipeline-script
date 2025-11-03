@@ -1,0 +1,82 @@
+pipeline {
+    agent any
+    environment {
+        SONARQUBE_SERVER = 'SonarQubeServer' 
+        ECR_REPO = '951132547844.dkr.ecr.us-east-1.amazonaws.com/test'
+        // CRITICAL FIX: Changed from Availability Zone 'us-east-1a' to the proper AWS Region 'us-east-1'.
+        // AWS ECR endpoints are region-based, not AZ-based.
+        AWS_REGION = 'us-east-1' 
+        IMAGE_NAME = 'newimage'
+        PATH = "/opt/sonar-scanner/bin:$PATH"
+    }
+    stages {
+        stage('Pull Code From GitHub') {
+            steps {
+                git 'https://github.com/sakthipachaiyappan78-cell/sakthi-projects.git'
+            }
+        }
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv("${SONARQUBE_SERVER}") {
+                    sh 'sonar-scanner'
+                }
+            }
+        }
+        stage('Build the Docker image') {
+            steps {
+                // FIX: Changed to double quotes for variable interpolation
+                sh "docker build -t ${IMAGE_NAME} ."
+            }
+        }
+        stage('Image Scan') {
+            steps {
+                // FIX: Changed to double quotes for variable interpolation
+                sh "trivy image ${IMAGE_NAME}:latest > report.txt"
+            }
+        }
+        stage('Push to ECR') {
+            steps {
+                // CRITICAL FIX: Use 'usernamePassword' binding which correctly maps the 
+                // "Username with password" credential type to environment variables (AWS_ID/AWS_SECRET).
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'aws-creds',
+                        usernameVariable: 'AWS_ID',     // Maps Access Key ID
+                        passwordVariable: 'AWS_SECRET'  // Maps Secret Key
+                    )
+                ]) {
+                    sh '''
+                        # Export the Groovy variables to the standard AWS environment variables.
+                        export AWS_ACCESS_KEY_ID=$AWS_ID
+                        export AWS_SECRET_ACCESS_KEY=$AWS_SECRET
+                        
+                        # Use the corrected AWS_REGION variable
+                        aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REPO
+                        docker tag $IMAGE_NAME:latest $ECR_REPO:$BUILD_NUMBER
+                        docker push $ECR_REPO:$BUILD_NUMBER
+                    '''
+                }
+            }
+        }
+        stage('Deploy') {
+            steps {
+                sh '''
+                    sed -i "s|_IMAGE_|$ECR_REPO:$BUILD_NUMBER|g" pod.yaml
+                    kubectl apply -f pod.yaml     
+                '''
+            }
+        }
+    }
+    post {
+        success {
+            mail to: 'sakthi.p-extgen@hathway.net',
+                 subject: "SUCCESS: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]'",
+                 body: "Good news! Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]' completed successfully. \nCheck it here: ${env.BUILD_URL}"
+        }
+        failure {
+            mail to: 'sakthi.p-extgen@hathway.net',
+                 subject: "FAILURE: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]'",
+                 body: "Oops! Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]' has failed. \nCheck logs here: ${env.BUILD_URL}"
+        }
+    }
+}
